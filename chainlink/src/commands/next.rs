@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::Serialize;
 use std::path::Path;
 
 use crate::db::Database;
@@ -11,6 +12,35 @@ type Progress = Option<(i32, i32)>;
 
 /// Scored issue with priority score and progress
 type ScoredIssue = (Issue, i32, Progress);
+
+#[derive(Clone)]
+struct RecommendedIssue {
+    issue: Issue,
+    progress: Progress,
+}
+
+struct Recommendations {
+    next: Option<RecommendedIssue>,
+    also_ready: Vec<RecommendedIssue>,
+}
+
+#[derive(Serialize)]
+struct NextJson {
+    next: Option<RecommendedIssueJson>,
+    also_ready: Vec<RecommendedIssueJson>,
+}
+
+#[derive(Serialize)]
+struct RecommendedIssueJson {
+    issue: Issue,
+    progress: Option<ProgressJson>,
+}
+
+#[derive(Serialize)]
+struct ProgressJson {
+    completed_subissues: i32,
+    total_subissues: i32,
+}
 
 /// Priority order for sorting (higher = more important)
 fn priority_weight(priority: &str) -> i32 {
@@ -35,35 +65,39 @@ fn calculate_progress(db: &Database, issue: &Issue) -> Result<Progress> {
     Ok(Some((closed, total)))
 }
 
-pub fn run(db: &Database, chainlink_dir: &Path) -> Result<()> {
+fn is_locked_by_other(chainlink_dir: &Path, issue_id: i64) -> bool {
+    matches!(
+        lock_check::check_lock(chainlink_dir, issue_id),
+        Ok(LockStatus::LockedByOther { stale: false, .. })
+    )
+}
+
+fn recommendations(db: &Database, chainlink_dir: &Path) -> Result<Recommendations> {
     let ready = db.list_ready_issues()?;
 
     if ready.is_empty() {
-        println!("No issues ready to work on.");
-        println!(
-            "Use 'chainlink list' to see all issues or 'chainlink blocked' to see blocked issues."
-        );
-        return Ok(());
+        return Ok(Recommendations {
+            next: None,
+            also_ready: Vec::new(),
+        });
     }
 
     // Score and sort issues
     let mut scored: Vec<ScoredIssue> = Vec::new();
 
-    for issue in ready {
+    for issue in &ready {
         // Skip subissues - we want to recommend parent issues or standalone issues
         if issue.parent_id.is_some() {
             continue;
         }
 
         // Best-effort: skip issues locked by other agents
-        if let Ok(LockStatus::LockedByOther { stale: false, .. }) =
-            lock_check::check_lock(chainlink_dir, issue.id)
-        {
+        if is_locked_by_other(chainlink_dir, issue.id) {
             continue;
         }
 
         let priority_score = priority_weight(&issue.priority) * 100;
-        let progress = calculate_progress(db, &issue)?;
+        let progress = calculate_progress(db, issue)?;
 
         // Boost score for issues that are partially complete (finish what you started)
         let progress_bonus = match &progress {
@@ -72,7 +106,7 @@ pub fn run(db: &Database, chainlink_dir: &Path) -> Result<()> {
         };
 
         let score = priority_score + progress_bonus;
-        scored.push((issue, score, progress));
+        scored.push((issue.clone(), score, progress));
     }
 
     // Sort by score descending
@@ -80,37 +114,68 @@ pub fn run(db: &Database, chainlink_dir: &Path) -> Result<()> {
 
     if scored.is_empty() {
         // All ready issues are subissues, show them instead
-        let ready = db.list_ready_issues()?;
-        if let Some(issue) = ready.first() {
-            println!(
-                "Next: {} [{}] {}",
-                format_issue_id(issue.id),
-                issue.priority,
-                issue.title
-            );
-            if let Some(parent_id) = issue.parent_id {
-                println!("       (subissue of {})", format_issue_id(parent_id));
-            }
-        } else {
-            println!("No issues ready to work on.");
+        let mut subissues = ready
+            .into_iter()
+            .filter(|issue| issue.parent_id.is_some())
+            .filter(|issue| !is_locked_by_other(chainlink_dir, issue.id))
+            .map(|issue| RecommendedIssue {
+                issue,
+                progress: None,
+            });
+
+        return Ok(Recommendations {
+            next: subissues.next(),
+            also_ready: subissues.take(3).collect(),
+        });
+    }
+
+    let mut recommended = scored
+        .into_iter()
+        .map(|(issue, _score, progress)| RecommendedIssue { issue, progress });
+
+    Ok(Recommendations {
+        next: recommended.next(),
+        also_ready: recommended.take(3).collect(),
+    })
+}
+
+pub fn run(db: &Database, chainlink_dir: &Path) -> Result<()> {
+    let recommendations = recommendations(db, chainlink_dir)?;
+
+    let Some(top) = &recommendations.next else {
+        println!("No issues ready to work on.");
+        println!(
+            "Use 'chainlink list' to see all issues or 'chainlink blocked' to see blocked issues."
+        );
+        return Ok(());
+    };
+
+    if top.issue.parent_id.is_some() {
+        println!(
+            "Next: {} [{}] {}",
+            format_issue_id(top.issue.id),
+            top.issue.priority,
+            top.issue.title
+        );
+        if let Some(parent_id) = top.issue.parent_id {
+            println!("       (subissue of {})", format_issue_id(parent_id));
         }
         return Ok(());
     }
 
     // Recommend the top issue
-    let (top, _score, progress) = &scored[0];
     println!(
         "Next: {} [{}] {}",
-        format_issue_id(top.id),
-        top.priority,
-        top.title
+        format_issue_id(top.issue.id),
+        top.issue.priority,
+        top.issue.title
     );
 
-    if let Some((closed, total)) = progress {
+    if let Some((closed, total)) = top.progress {
         println!("       Progress: {}/{} subissues complete", closed, total);
     }
 
-    if let Some(desc) = &top.description {
+    if let Some(desc) = &top.issue.description {
         if !desc.is_empty() {
             let preview: String = desc.chars().take(80).collect();
             let suffix = if desc.chars().count() > 80 { "..." } else { "" };
@@ -119,27 +184,56 @@ pub fn run(db: &Database, chainlink_dir: &Path) -> Result<()> {
     }
 
     println!();
-    println!("Run: chainlink session work {}", top.id);
+    println!("Run: chainlink session work {}", top.issue.id);
 
     // Show runners-up if any
-    if scored.len() > 1 {
+    if !recommendations.also_ready.is_empty() {
         println!();
         println!("Also ready:");
-        for (issue, _score, progress) in scored.iter().skip(1).take(3) {
-            let progress_str = match progress {
+        for issue in &recommendations.also_ready {
+            let progress_str = match issue.progress {
                 Some((c, t)) => format!(" ({}/{})", c, t),
                 None => String::new(),
             };
             println!(
                 "  {} [{}] {}{}",
-                format_issue_id(issue.id),
-                issue.priority,
-                issue.title,
+                format_issue_id(issue.issue.id),
+                issue.issue.priority,
+                issue.issue.title,
                 progress_str
             );
         }
     }
 
+    Ok(())
+}
+
+fn progress_json(progress: Progress) -> Option<ProgressJson> {
+    progress.map(|(completed_subissues, total_subissues)| ProgressJson {
+        completed_subissues,
+        total_subissues,
+    })
+}
+
+fn recommended_issue_json(recommended: RecommendedIssue) -> RecommendedIssueJson {
+    RecommendedIssueJson {
+        issue: recommended.issue,
+        progress: progress_json(recommended.progress),
+    }
+}
+
+pub fn run_json(db: &Database, chainlink_dir: &Path) -> Result<()> {
+    let recommendations = recommendations(db, chainlink_dir)?;
+    let output = NextJson {
+        next: recommendations.next.map(recommended_issue_json),
+        also_ready: recommendations
+            .also_ready
+            .into_iter()
+            .map(recommended_issue_json)
+            .collect(),
+    };
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
 }
 

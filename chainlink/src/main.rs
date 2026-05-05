@@ -25,7 +25,7 @@ struct Cli {
     #[arg(short, long, global = true)]
     quiet: bool,
 
-    /// Output as JSON (supported by list, show, search, session status)
+    /// Output as JSON (supported by list, show, search, next, session status)
     #[arg(long, global = true)]
     json: bool,
 
@@ -1184,7 +1184,11 @@ fn dispatch_issue(action: IssueCommands, quiet: bool, json: bool) -> Result<()> 
         IssueCommands::Next => {
             let db = get_db()?;
             let chainlink_dir = find_chainlink_dir()?;
-            commands::next::run(&db, &chainlink_dir)
+            if json {
+                commands::next::run_json(&db, &chainlink_dir)
+            } else {
+                commands::next::run(&db, &chainlink_dir)
+            }
         }
 
         IssueCommands::Tree { status } => {

@@ -887,6 +887,89 @@ fn test_next_no_issues() {
     );
 }
 
+#[test]
+fn test_next_json_command() {
+    let dir = tempdir().unwrap();
+    init_chainlink(dir.path());
+
+    run_chainlink(
+        dir.path(),
+        &["issue", "create", "Low priority", "-p", "low"],
+    );
+    run_chainlink(
+        dir.path(),
+        &["issue", "create", "High priority", "-p", "high"],
+    );
+
+    let (success, stdout, stderr) = run_chainlink(dir.path(), &["issue", "next", "--json"]);
+
+    assert!(success, "stderr: {}", stderr);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("next --json should emit valid JSON");
+
+    assert_eq!(json["next"]["issue"]["title"], "High priority");
+    assert!(
+        json["also_ready"].is_array(),
+        "also_ready should be an array: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("Next:"),
+        "JSON output should not contain freeform Next label: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("Run:"),
+        "JSON output should not contain freeform Run label: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_next_json_no_ready_issues() {
+    let dir = tempdir().unwrap();
+    init_chainlink(dir.path());
+
+    let (success, stdout, stderr) = run_chainlink(dir.path(), &["issue", "next", "--json"]);
+
+    assert!(success, "stderr: {}", stderr);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("next --json should emit valid JSON");
+
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "next": null,
+            "also_ready": []
+        })
+    );
+}
+
+#[test]
+fn test_next_json_with_subissue_progress() {
+    let dir = tempdir().unwrap();
+    init_chainlink(dir.path());
+
+    run_chainlink(
+        dir.path(),
+        &["issue", "create", "Parent task", "-p", "high"],
+    );
+    run_chainlink(dir.path(), &["issue", "subissue", "1", "Sub 1"]);
+    run_chainlink(dir.path(), &["issue", "subissue", "1", "Sub 2"]);
+    run_chainlink(dir.path(), &["issue", "subissue", "1", "Sub 3"]);
+    run_chainlink(dir.path(), &["issue", "close", "2"]);
+
+    let (success, stdout, stderr) = run_chainlink(dir.path(), &["issue", "next", "--json"]);
+
+    assert!(success, "stderr: {}", stderr);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("next --json should emit valid JSON");
+
+    assert_eq!(json["next"]["issue"]["title"], "Parent task");
+    assert_eq!(json["next"]["progress"]["completed_subissues"], 1);
+    assert_eq!(json["next"]["progress"]["total_subissues"], 3);
+}
+
 // ==================== Export/Import Tests ====================
 
 #[test]
