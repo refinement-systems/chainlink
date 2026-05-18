@@ -1145,7 +1145,11 @@ fn dispatch_issue(action: IssueCommands, quiet: bool, json: bool) -> Result<()> 
 
         IssueCommands::Ready => {
             let db = get_db()?;
-            commands::deps::list_ready(&db)
+            if json {
+                commands::deps::list_ready_json(&db)
+            } else {
+                commands::deps::list_ready(&db)
+            }
         }
 
         IssueCommands::Relate {

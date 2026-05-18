@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use serde_json;
 
 use crate::db::Database;
 use crate::utils::{format_issue_id, truncate};
@@ -57,6 +58,12 @@ pub fn list_blocked(db: &Database) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+pub fn list_ready_json(db: &Database) -> Result<()> {
+    let issues = db.list_ready_issues()?;
+    println!("{}", serde_json::to_string_pretty(&issues)?);
     Ok(())
 }
 
